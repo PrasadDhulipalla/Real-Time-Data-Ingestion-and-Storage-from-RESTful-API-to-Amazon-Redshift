@@ -1,0 +1,175 @@
+#consumer.py 
+
+
+import logging
+import traceback
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col
+from pyspark.sql.types import StructType, StringType, IntegerType
+import psycopg2
+
+# Set up logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
+
+logger.info("Starting Spark Session...")
+
+spark = SparkSession.builder \
+    .appName("Kafka to Redshift") \
+    .config("spark.jars", "/dbfs/FileStore/jars/redshift_jdbc42_2_1_0_30.jar") \
+    .getOrCreate()
+
+logger.info("Spark Session started.")
+
+# Kafka and Redshift configs
+KAFKA_BROKER = "localhost:9092"
+TOPIC = "randomuser-topic"
+
+REDSHIFT_JDBC_URL = "jdbc:redshift://default-workgroup.517977918879.eu-west-2.redshift-serverless.amazonaws.com:5439/dev"
+REDSHIFT_USER = "admin"
+REDSHIFT_PASSWORD = "Welcomedp*123456"
+REDSHIFT_TABLE = "public.random_users"
+
+# Define schema
+user_schema = StructType() \
+    .add("uuid", StringType()) \
+    .add("first_name", StringType()) \
+    .add("last_name", StringType()) \
+    .add("gender", StringType()) \
+    .add("address", StringType()) \
+    .add("email", StringType()) \
+    .add("username", StringType()) \
+    .add("password", StringType()) \
+    .add("age", IntegerType()) \
+    .add("phone", StringType()) \
+    .add("cell", StringType()) \
+    .add("registered_date", StringType()) \
+    .add("registered_age", IntegerType()) \
+    .add("id_name", StringType()) \
+    .add("id_value", StringType()) \
+    .add("picture_large", StringType()) \
+    .add("picture_medium", StringType()) \
+    .add("picture_thumbnail", StringType())
+
+logger.info("Schema defined.")
+
+# Read Kafka Stream
+logger.info(f"Starting to read Kafka stream from topic: {TOPIC}")
+df_raw = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", KAFKA_BROKER) \
+    .option("subscribe", TOPIC) \
+    .option("startingOffsets", "latest") \
+    .load()
+
+df_parsed = df_raw.selectExpr("CAST(value AS STRING)") \
+    .select(from_json(col("value"), user_schema).alias("data")) \
+    .select("data.*")
+
+df_parsed.writeStream \
+    .format("console") \
+    .outputMode("append") \
+    .start()
+#print(df_parsed)
+
+logger.info("Kafka stream read and parsed.")
+
+# Create Redshift table if it doesn't exist
+def create_redshift_table():
+    logger.info("Connecting to Redshift to create table if not exists...")
+    try:
+        conn = psycopg2.connect(
+            host="default-workgroup.517977918879.eu-west-2.redshift-serverless.amazonaws.com",
+            port="5439",
+            dbname="dev",
+            user=REDSHIFT_USER,
+            password=REDSHIFT_PASSWORD
+        )
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {REDSHIFT_TABLE} (
+                uuid VARCHAR PRIMARY KEY,
+                first_name VARCHAR,
+                last_name VARCHAR,
+                gender VARCHAR,
+                address VARCHAR,
+                email VARCHAR,
+                username VARCHAR,
+                password VARCHAR,
+                age INT,
+                phone VARCHAR,
+                cell VARCHAR,
+                registered_date VARCHAR,
+                registered_age INT,
+                id_name VARCHAR,
+                id_value VARCHAR,
+                picture_large VARCHAR,
+                picture_medium VARCHAR,
+                picture_thumbnail VARCHAR
+            );
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logger.info(f"Table {REDSHIFT_TABLE} checked/created successfully.")
+    except Exception as e:
+        logger.error(f"Error creating Redshift table: {e}")
+        logger.error(traceback.format_exc())
+
+create_redshift_table()
+
+# Write each batch to Redshift with logging
+def write_to_redshift(batch_df, batch_id):
+    logger.info(f"Processing batch {batch_id} with {batch_df.count()} records")
+    try:
+        batch_df = batch_df.dropDuplicates(["uuid"])
+        logger.info(f"After dropping duplicates, batch {batch_id} has {batch_df.count()} records")
+
+        existing_uuids_df = spark.read \
+            .format("jdbc") \
+            .option("url", REDSHIFT_JDBC_URL) \
+            .option("dbtable", REDSHIFT_TABLE) \
+            .option("user", REDSHIFT_USER) \
+            .option("password", REDSHIFT_PASSWORD) \
+            .load() \
+            .select("uuid")
+
+        new_df = batch_df.join(existing_uuids_df, on="uuid", how="left_anti").cache()
+        logger.info(f"Batch {batch_id}: {new_df.count()} new records to insert")
+        new_df.show(5, truncate=False)
+
+        if new_df.count() > 0:
+            new_df.write \
+                .format("jdbc") \
+                .option("url", REDSHIFT_JDBC_URL) \
+                .option("dbtable", REDSHIFT_TABLE) \
+                .option("user", REDSHIFT_USER) \
+                .option("password", REDSHIFT_PASSWORD) \
+                .mode("append") \
+                .save()
+            logger.info(f"Batch {batch_id} written to Redshift successfully.")
+        else:
+            logger.info(f"Batch {batch_id} has no new records to write.")
+    except Exception as e:
+        logger.error(f"Error processing batch {batch_id}: {e}")
+        logger.error(traceback.format_exc())
+
+logger.info("Starting streaming write to Redshift...")
+
+query = df_parsed.writeStream \
+    .foreachBatch(write_to_redshift) \
+    .outputMode("append") \
+    .start()
+
+# Optional: Monitor query status every 60s
+import threading, time
+def monitor():
+    while True:
+        for q in spark.streams.active:
+            logger.info(f"Query {q.name} active: {q.isActive}, Status: {q.status}")
+        time.sleep(60)
+
+threading.Thread(target=monitor, daemon=True).start()
+
+query.awaitTermination()
